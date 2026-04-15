@@ -67,6 +67,23 @@ class PolymarketConfig:
     min_volume_24h_usd: float = 100.0        # Min 24h volume
     max_spread_for_endgame: float = 0.03     # 3-cent max spread on endgame plays
 
+    # Endgame: minimum annualised ROI (filters out slow markets tying up capital)
+    # e.g. 0.20 = 20% APY; a 97% market resolving in 60 days yields ~3%/60d ≈ 18% APY → rejected
+    endgame_min_annualized_roi: float = 0.20
+
+    # Kelly-proportional position sizing for Sum-to-One arb
+    # Bet scales linearly with gross spread; full max_bet is reached at
+    # kelly_fraction × s2o_min_spread_pct.  E.g. kelly_fraction=4, min_spread=3%
+    # → full size at 12% spread, quarter size at 3% spread.
+    kelly_fraction: float = 4.0
+
+    # Order-book freshness: reject cached WS books older than this many seconds
+    # and fall back to a live REST fetch instead.
+    book_max_age_s: float = 10.0
+
+    # Deduplication: minimum seconds between execution attempts on the same market
+    attempt_cooldown_s: float = 30.0
+
     # ── Section 3: WebSocket (Data Collector) ─────────────────────────────────
     clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     # Section 3 bottom note: "WebSocket ping intervals: 10s (CLOB), 5s (Real-Time Stream)"

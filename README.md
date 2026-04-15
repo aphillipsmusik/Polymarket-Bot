@@ -46,11 +46,18 @@ Net profit ≈ $0.02 per token (minus ~2% taker fee + gas)
 
 Execution uses Fill-or-Kill (FOK) orders. If leg 1 fills but leg 2 fails, leg 1 is immediately unwound.
 
+**Kelly-proportional sizing:** position size scales linearly with the gross spread. At the minimum spread threshold the bot bets a fraction of the cap; at `kelly_fraction × min_spread` it bets the full cap. This allocates more capital to higher-edge opportunities rather than betting a flat amount on every qualifying spread.
+
 ### 2. Endgame
-Buy a near-certain outcome when YES probability is between 95–99%. Holds to resolution.
+Buy a near-certain outcome when YES or NO probability is between 95–99%. Holds to resolution.
+
+Three filters are applied before entry:
+- **Annualised ROI** — rejects markets where the yield per day is below `endgame_min_annualized_roi` (default 20% APY). A 97% market resolving in 90 days yields ~12% annualised and is skipped; the same market resolving in 10 days yields ~109% and is taken.
+- **Liquidity check** — sizes only to the depth actually available at the ask price. If less than $1 is available the trade is skipped entirely.
+- **Both YES and NO** are assessed from their own order books. Previously the NO price was estimated from the YES bid, producing incorrect entry prices.
 
 ### 3. Combinatorial
-Extends Sum-to-One to markets with more than two outcomes — buy all outcomes when their total cost is below $1.00.
+Extends Sum-to-One to markets with more than two outcomes — buy all outcomes when their total cost is below $1.00. Position size is computed as `budget / sum(all asks)` so each outcome gets exactly K tokens (each of which pays $1.00 at resolution).
 
 ### 4. Cross-Platform (detection only)
 Flags price gaps of 5%+ between Polymarket and other platforms. Manual execution required on the external platform.
@@ -65,8 +72,12 @@ Flags price gaps of 5%+ between Polymarket and other platforms. Manual execution
 | Max total exposure | 10% of capital | Portfolio-level cap |
 | Max bet size | $5 | Hard per-trade ceiling |
 | Daily loss cap | 5% of starting capital | Halts all trading for the day |
-| Circuit breaker | 5 consecutive losses | 5-minute cooldown before resuming |
+| Circuit breaker | 5 consecutive `FAIL_UNWIND` losses | 5-minute cooldown before resuming |
 | Kill switch | Manual (`--kill`) | Emergency stop |
+| Book staleness | 10s max age | Stale WS snapshots trigger a live REST fetch before any trade |
+| Opportunity deduplication | 30s cooldown | Prevents the WS callback and batch scanner from double-executing the same market |
+
+**Circuit breaker distinction:** a `PARTIAL_UNWIND` (leg 1 filled, leg 2 failed, unwind succeeded — small bounded loss) does not count toward the consecutive-loss counter. Only `FAIL_UNWIND` (capital stuck in an unhedged position) triggers the breaker, since that is the genuinely dangerous outcome.
 
 ---
 
@@ -139,14 +150,18 @@ Capital:
   --max-exposure-pct N   Max % of capital in open positions (default: 10)
 
 Strategy:
-  --min-spread N         Minimum spread in cents to act on (default: 3)
-  --taker-fee N          Taker fee in cents (default: 2)
-  --endgame-min N        Lower bound % for endgame strategy (default: 95)
-  --endgame-max N        Upper bound % for endgame strategy (default: 99)
+  --min-spread N              Minimum spread in cents to act on (default: 3)
+  --taker-fee N               Taker fee in cents (default: 2)
+  --endgame-min N             Lower bound % for endgame strategy (default: 95)
+  --endgame-max N             Upper bound % for endgame strategy (default: 99)
+  --kelly-fraction N          Spread multiples for full-size S2O bet (default: 4)
+  --endgame-min-annualized N  Min annualised ROI % for endgame trades (default: 20)
 
 Risk:
-  --daily-loss-cap N     Daily loss cap as % of capital (default: 5)
-  --circuit-breaker N    Consecutive losses before halt (default: 5)
+  --daily-loss-cap N          Daily loss cap as % of capital (default: 5)
+  --circuit-breaker N         Consecutive FAIL_UNWIND losses before halt (default: 5)
+  --book-max-age N            Max order-book age in seconds before REST refresh (default: 10)
+  --attempt-cooldown N        Seconds between execution attempts on the same market (default: 30)
 
 Execution:
   --scan-interval N      Seconds between market scans (default: 10)
@@ -166,7 +181,106 @@ Logging:
 
 ---
 
-## Deployment (VPS / systemd)
+## Deployment
+
+### Raspberry Pi (Live Bot + Remote Dashboard)
+
+The bot ran on a Raspberry Pi, with the web dashboard accessible remotely for monitoring live P&L from any device. The Pi handled both the trading process and serving the dashboard over the local network (or via a VPN/tunnel for access from outside the home).
+
+**Setup on Raspberry Pi OS (Debian-based):**
+
+```bash
+# Install Python 3.11
+sudo apt-get update && sudo apt-get install -y python3.11 python3.11-venv
+
+# Clone and install
+git clone https://github.com/aphillipsmusik/polymarket-bot.git
+cd polymarket-bot
+python3.11 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Add your private key
+cp .env.example .env
+nano .env  # set POLYMARKET_PRIVATE_KEY=0x...
+```
+
+**Run the bot and dashboard together:**
+
+Run both processes so the live bot feeds P&L data while the dashboard serves it to remote browsers:
+
+```bash
+# Terminal 1 — live bot
+python polymarket_bot.py --live --capital 50
+
+# Terminal 2 — dashboard (binds to 0.0.0.0 so it's reachable on the network)
+python dashboard.py --port 5000 --no-browser
+```
+
+Then open `http://<raspberry-pi-ip>:5000` from any browser on your network to monitor P&L in real time.
+
+**Run both on boot with systemd:**
+
+```bash
+sudo nano /etc/systemd/system/polymarket-bot.service
+```
+
+```ini
+[Unit]
+Description=Polymarket Live Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/polymarket-bot
+EnvironmentFile=/home/pi/polymarket-bot/.env
+ExecStart=/home/pi/polymarket-bot/venv/bin/python polymarket_bot.py \
+    --live --capital 50 --log-level INFO
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo nano /etc/systemd/system/polymarket-dashboard.service
+```
+
+```ini
+[Unit]
+Description=Polymarket P&L Dashboard
+After=network.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/polymarket-bot
+ExecStart=/home/pi/polymarket-bot/venv/bin/python dashboard.py --port 5000 --no-browser
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable polymarket-bot polymarket-dashboard
+sudo systemctl start polymarket-bot polymarket-dashboard
+```
+
+**View logs:**
+
+```bash
+journalctl -u polymarket-bot -f
+journalctl -u polymarket-dashboard -f
+```
+
+The dashboard updates in real time via Server-Sent Events — no page refresh needed. It displays equity curve, open positions, win rate, Sharpe ratio, fill rate, and a live feed of arbitrage events.
+
+### VPS / systemd (Live Trading)
 
 An automated setup script provisions the server, creates a virtualenv, and installs a systemd service:
 

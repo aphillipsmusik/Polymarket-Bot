@@ -160,14 +160,23 @@ class RiskManager:
                 f"(daily_pnl=${self.state.daily_pnl:+.2f})"
             )
 
-        elif execution.result in (ArbResult.FAIL_UNWIND, ArbResult.PARTIAL_UNWIND):
-            # Actual loss (partial unwind = we lost money)
+        elif execution.result == ArbResult.FAIL_UNWIND:
+            # Leg 1 filled and the unwind also failed — real open exposure, count as loss
             self.state.consecutive_losses += 1
             logger.warning(
                 f"Risk: consecutive_losses = {self.state.consecutive_losses}  "
                 f"(result={execution.result.value})"
             )
             self._maybe_trip_circuit_breaker()
+
+        elif execution.result == ArbResult.PARTIAL_UNWIND:
+            # Leg 1 filled but leg 2 failed; unwind of leg 1 succeeded — small recoverable
+            # loss from slippage/fees on the unwind.  Does NOT count toward the circuit
+            # breaker because no capital is stuck and the loss is bounded.
+            logger.warning(
+                f"Risk: partial unwind — leg 1 recovered via unwind  "
+                f"(consecutive_losses unchanged: {self.state.consecutive_losses})"
+            )
 
         # MISS and SKIPPED don't count as losses (no money was at risk)
 
