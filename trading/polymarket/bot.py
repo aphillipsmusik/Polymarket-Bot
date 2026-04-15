@@ -113,6 +113,7 @@ class PolymarketBot:
         self._markets: Dict[str, Market] = {}         # condition_id → Market
         self._tid_to_cid: Dict[str, str] = {}         # token_id → condition_id
         self._book_ts: Dict[str, float] = {}          # token_id → last signal time
+        self._recent_attempts: Dict[str, float] = {}  # condition_id → monotonic time of last attempt
         self._scan_count = 0
         self._stop = False
 
@@ -198,6 +199,13 @@ class PolymarketBot:
             if new_tids:
                 await self.data.ws.add_subscriptions(new_tids)
                 logger.info(f"WS: subscribed {len(new_tids)} new tokens")
+
+            # Prune stale dedup entries so the dict doesn't grow unbounded
+            now = time.monotonic()
+            self._recent_attempts = {
+                cid: ts for cid, ts in self._recent_attempts.items()
+                if now - ts < self.config.attempt_cooldown_s
+            }
 
             # REST batch scan (catches opportunities before WS warms up)
             if not self.risk.state.trading_halted:
@@ -302,6 +310,19 @@ class PolymarketBot:
 
     async def _try_execute(self, opp: ArbOpportunity) -> None:
         """Run the full risk-check + execute + portfolio-update cycle."""
+        # Deduplication: the WS callback and the batch scanner can both detect
+        # the same opportunity if a spread persists across a scan cycle.
+        # Skip if we already attempted this market within the cooldown window.
+        now = time.monotonic()
+        last = self._recent_attempts.get(opp.condition_id, 0.0)
+        if now - last < self.config.attempt_cooldown_s:
+            logger.debug(
+                f"Dedup: skipping {opp.condition_id[:8]} "
+                f"(attempted {now - last:.1f}s ago)"
+            )
+            return
+        self._recent_attempts[opp.condition_id] = now
+
         if not self.risk.approve(opp, self.portfolio):
             return
 

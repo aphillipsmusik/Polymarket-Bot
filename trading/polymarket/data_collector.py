@@ -344,10 +344,22 @@ class DataCollector:
         return self.rest.get_active_markets(limit=limit)
 
     def get_book(self, token_id: str) -> Optional[OrderBookSnapshot]:
-        """Return live WS book, falling back to REST if WS hasn't updated yet."""
+        """
+        Return the freshest available order-book snapshot for a token.
+
+        Priority:
+          1. WS cache — if present and younger than book_max_age_s, use it.
+          2. REST fallback — if WS cache is absent or stale, fetch a live snapshot.
+        """
         book = self.ws.get_book(token_id)
         if book is not None:
-            return book
+            age_s = (datetime.utcnow() - book.timestamp).total_seconds()
+            if age_s <= self.config.book_max_age_s:
+                return book
+            logger.debug(
+                f"Book stale ({age_s:.1f}s > {self.config.book_max_age_s}s) "
+                f"for {token_id[:12]} — fetching REST fallback"
+            )
         return self.rest.get_order_book_rest(token_id)
 
     async def subscribe_markets(self, markets: List[Market]) -> int:

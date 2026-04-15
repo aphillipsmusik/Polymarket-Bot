@@ -103,7 +103,7 @@ class StrategyEngine:
 
         # 2. Endgame (single-leg, near-certain)
         if yes_book is not None:
-            opp = self._scan_endgame(market, yes_book)
+            opp = self._scan_endgame(market, yes_book, no_book)
             if opp is not None:
                 return opp
 
@@ -153,12 +153,15 @@ class StrategyEngine:
         no_liq  = no_book.depth_at_price(ask_no,  "ASK")
 
         equity_cap = self.config.initial_capital * self.config.max_position_pct
-        usdc_per_leg = min(
-            yes_liq,
-            no_liq,
-            equity_cap,
-            self.config.max_bet_usd,
-        )
+
+        # Kelly-proportional sizing: scale bet linearly with gross spread.
+        # At s2o_min_spread: 1/kelly_fraction of the cap.
+        # At s2o_min_spread × kelly_fraction: full cap.
+        # This allocates more capital to wider (higher-edge) opportunities.
+        edge_ratio   = min(1.0, gross_spread / (self.config.s2o_min_spread_pct * self.config.kelly_fraction))
+        kelly_cap    = edge_ratio * min(equity_cap, self.config.max_bet_usd)
+
+        usdc_per_leg = min(yes_liq, no_liq, kelly_cap)
 
         if usdc_per_leg < 1.0:
             return None
@@ -258,10 +261,15 @@ class StrategyEngine:
         if gross_spread < self.config.s2o_min_spread_pct:
             return None
 
-        # Same fee/profit logic as sum-to-one
-        equity_cap = self.config.initial_capital * self.config.max_position_pct
-        usdc_per_leg = min(equity_cap, self.config.max_bet_usd)
-        k = usdc_per_leg / max(asks) if max(asks) > 0 else 0
+        # Each outcome pays $1.00 per token at resolution, so we want K tokens of
+        # every outcome.  Total cost = K × sum(asks).  Solving for K given a
+        # fixed USDC budget: K = budget / sum(asks).
+        # The old formula (budget / max(asks)) over-sized the cheap legs and
+        # under-sized the expensive ones, mis-stating cost and profit.
+        equity_cap   = self.config.initial_capital * self.config.max_position_pct
+        usdc_budget  = min(equity_cap, self.config.max_bet_usd)
+        sum_asks     = sum(asks)
+        k = usdc_budget / sum_asks if sum_asks > 0 else 0
 
         if k < 0.01:
             return None
@@ -307,6 +315,7 @@ class StrategyEngine:
         self,
         market: Market,
         yes_book: OrderBookSnapshot,
+        no_book: Optional[OrderBookSnapshot] = None,
     ) -> Optional[ArbOpportunity]:
         """
         Section 4: Endgame Arbitrage — 95–99% probability positions.
@@ -315,25 +324,26 @@ class StrategyEngine:
         Profit = (1.00 − ask_price) − taker_fee − gas/size.
 
         Risk: the market could flip.  Mitigated by staying within 99% max.
+
+        Both YES and NO are priced from their own order books.  Previously NO
+        was estimated from the YES bid (1 − best_bid_yes), which ignored the
+        real NO spread and produced incorrect entry prices.
         """
         ask_yes = yes_book.best_ask
         if ask_yes is None:
             return None
 
         # Check if YES is in the endgame zone
-        if not (self.config.endgame_min_prob <= ask_yes <= self.config.endgame_max_prob):
-            # Maybe NO is near-certain instead (YES at 1–5%)
-            ask_no = 1.0 - (yes_book.best_bid or ask_yes)
-            if not (self.config.endgame_min_prob <= ask_no <= self.config.endgame_max_prob):
-                return None
-            # Flip to buy NO side
-            return self._endgame_leg(
-                market, market.no_token.token_id, "NO", ask_no
-            )
+        if self.config.endgame_min_prob <= ask_yes <= self.config.endgame_max_prob:
+            return self._endgame_leg(market, market.yes_token.token_id, "YES", ask_yes, yes_book)
 
-        return self._endgame_leg(
-            market, market.yes_token.token_id, "YES", ask_yes
-        )
+        # Check if NO is near-certain — requires the real NO book
+        if no_book is not None:
+            ask_no = no_book.best_ask
+            if ask_no is not None and self.config.endgame_min_prob <= ask_no <= self.config.endgame_max_prob:
+                return self._endgame_leg(market, market.no_token.token_id, "NO", ask_no, no_book)
+
+        return None
 
     def _endgame_leg(
         self,
@@ -341,21 +351,53 @@ class StrategyEngine:
         token_id: str,
         label: str,
         ask: float,
+        book: OrderBookSnapshot,
     ) -> Optional[ArbOpportunity]:
-        """Build a single-leg endgame opportunity."""
-        # Payout is $1.00 at resolution
+        """
+        Build a single-leg endgame opportunity.
+
+        Checks (in order):
+          1. Annualised ROI — rejects slow markets that tie up capital below target APY.
+          2. Available liquidity — sizes only to what the book can actually fill.
+          3. Minimum flat ROI — final net_pct gate.
+        """
+        # ── Time-value filter ─────────────────────────────────────────────────
+        # Holding capital in a 97% market for 60 days yields ~3%/60d ≈ 18% APY.
+        # Skip if that's below endgame_min_annualized_roi (default 20%).
+        days = market.days_to_resolution
         gross_profit_per_token = 1.0 - ask
-        fee_per_token          = ask * self.config.taker_fee_rate
+        if days is not None and days > 0:
+            # Rough annualised yield: (gross per token / ask) × (365 / days)
+            annualised = (gross_profit_per_token / ask) * (365.0 / days)
+            if annualised < self.config.endgame_min_annualized_roi:
+                logger.debug(
+                    f"Endgame {label} rejected: annualised ROI "
+                    f"{annualised*100:.1f}% < {self.config.endgame_min_annualized_roi*100:.0f}%  "
+                    f"({days:.0f}d to resolution)"
+                )
+                return None
 
-        equity_cap  = self.config.initial_capital * self.config.max_position_pct
-        usdc_size   = min(equity_cap, self.config.max_bet_usd)
-        k           = usdc_size / ask
+        # ── Liquidity-aware sizing ────────────────────────────────────────────
+        available_liq = book.depth_at_price(ask, "ASK")
+        equity_cap    = self.config.initial_capital * self.config.max_position_pct
+        usdc_size     = min(equity_cap, self.config.max_bet_usd, available_liq)
 
-        gross       = k * gross_profit_per_token
-        fee         = k * fee_per_token
-        gas         = self.config.gas_cost_usd
-        net_profit  = gross - fee - gas
-        net_pct     = net_profit / usdc_size if usdc_size > 0 else 0
+        if usdc_size < 1.0:
+            logger.debug(
+                f"Endgame {label} rejected: insufficient liquidity "
+                f"${available_liq:.2f} at ask={ask:.4f}"
+            )
+            return None
+
+        k = usdc_size / ask
+
+        # ── Profit calculation ────────────────────────────────────────────────
+        fee_per_token = ask * self.config.taker_fee_rate
+        gross         = k * gross_profit_per_token
+        fee           = k * fee_per_token
+        gas           = self.config.gas_cost_usd
+        net_profit    = gross - fee - gas
+        net_pct       = net_profit / usdc_size if usdc_size > 0 else 0
 
         if net_pct < self.config.endgame_min_roi:
             return None
