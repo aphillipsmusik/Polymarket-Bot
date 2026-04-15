@@ -166,7 +166,61 @@ Logging:
 
 ---
 
-## Deployment (VPS / systemd)
+## Deployment
+
+### Raspberry Pi Dashboard
+
+The web dashboard (`dashboard.py`) is deployed on a Raspberry Pi as a local monitoring display. Because the dashboard only runs the paper-trading simulation — it makes no live orders — it needs no private key and is safe to leave running continuously.
+
+**Setup on Raspberry Pi OS (Debian-based):**
+
+```bash
+# Install Python 3.11
+sudo apt-get update && sudo apt-get install -y python3.11 python3.11-venv
+
+# Clone and install
+git clone https://github.com/aphillipsmusik/polymarket-bot.git
+cd polymarket-bot
+python3.11 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Start the dashboard (accessible from any device on your local network)
+python dashboard.py --port 5000 --no-browser
+```
+
+Then open `http://<raspberry-pi-ip>:5000` from any browser on the same network.
+
+**Run on boot with systemd:**
+
+```bash
+sudo nano /etc/systemd/system/polymarket-dashboard.service
+```
+
+```ini
+[Unit]
+Description=Polymarket Dashboard
+After=network.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/polymarket-bot
+ExecStart=/home/pi/polymarket-bot/venv/bin/python dashboard.py --port 5000 --no-browser
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable polymarket-dashboard
+sudo systemctl start polymarket-dashboard
+```
+
+The dashboard updates in real time via Server-Sent Events — no page refresh needed. It displays equity curve, open positions, win rate, Sharpe ratio, fill rate, and a live feed of arbitrage events.
+
+### VPS / systemd (Live Trading)
 
 An automated setup script provisions the server, creates a virtualenv, and installs a systemd service:
 
