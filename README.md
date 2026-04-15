@@ -168,9 +168,9 @@ Logging:
 
 ## Deployment
 
-### Raspberry Pi Dashboard
+### Raspberry Pi (Live Bot + Remote Dashboard)
 
-The web dashboard (`dashboard.py`) is deployed on a Raspberry Pi as a local monitoring display. Because the dashboard only runs the paper-trading simulation — it makes no live orders — it needs no private key and is safe to leave running continuously.
+The bot ran on a Raspberry Pi, with the web dashboard accessible remotely for monitoring live P&L from any device. The Pi handled both the trading process and serving the dashboard over the local network (or via a VPN/tunnel for access from outside the home).
 
 **Setup on Raspberry Pi OS (Debian-based):**
 
@@ -185,13 +185,51 @@ python3.11 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# Start the dashboard (accessible from any device on your local network)
+# Add your private key
+cp .env.example .env
+nano .env  # set POLYMARKET_PRIVATE_KEY=0x...
+```
+
+**Run the bot and dashboard together:**
+
+Run both processes so the live bot feeds P&L data while the dashboard serves it to remote browsers:
+
+```bash
+# Terminal 1 — live bot
+python polymarket_bot.py --live --capital 50
+
+# Terminal 2 — dashboard (binds to 0.0.0.0 so it's reachable on the network)
 python dashboard.py --port 5000 --no-browser
 ```
 
-Then open `http://<raspberry-pi-ip>:5000` from any browser on the same network.
+Then open `http://<raspberry-pi-ip>:5000` from any browser on your network to monitor P&L in real time.
 
-**Run on boot with systemd:**
+**Run both on boot with systemd:**
+
+```bash
+sudo nano /etc/systemd/system/polymarket-bot.service
+```
+
+```ini
+[Unit]
+Description=Polymarket Live Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/polymarket-bot
+EnvironmentFile=/home/pi/polymarket-bot/.env
+ExecStart=/home/pi/polymarket-bot/venv/bin/python polymarket_bot.py \
+    --live --capital 50 --log-level INFO
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ```bash
 sudo nano /etc/systemd/system/polymarket-dashboard.service
@@ -199,7 +237,7 @@ sudo nano /etc/systemd/system/polymarket-dashboard.service
 
 ```ini
 [Unit]
-Description=Polymarket Dashboard
+Description=Polymarket P&L Dashboard
 After=network.target
 
 [Service]
@@ -214,8 +252,15 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo systemctl enable polymarket-dashboard
-sudo systemctl start polymarket-dashboard
+sudo systemctl enable polymarket-bot polymarket-dashboard
+sudo systemctl start polymarket-bot polymarket-dashboard
+```
+
+**View logs:**
+
+```bash
+journalctl -u polymarket-bot -f
+journalctl -u polymarket-dashboard -f
 ```
 
 The dashboard updates in real time via Server-Sent Events — no page refresh needed. It displays equity curve, open positions, win rate, Sharpe ratio, fill rate, and a live feed of arbitrage events.
