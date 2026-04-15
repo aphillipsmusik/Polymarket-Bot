@@ -1,0 +1,65 @@
+[Unit]
+Description=Polymarket Automated Arbitrage Bot
+Documentation=https://github.com/aphillipsmusik/primary
+After=network-online.target
+Wants=network-online.target
+# Restart on any failure, including network drops during bot operation
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket
+
+# Load POLYMARKET_PRIVATE_KEY and any other vars from .env
+EnvironmentFile=/opt/polymarket/.env
+
+# Main process — runs live trading by default
+# To run paper trading instead, change to:
+#   ExecStart=/opt/polymarket/venv/bin/python simulate.py
+ExecStart=/opt/polymarket/venv/bin/python polymarket_bot.py \
+    --capital 50 \
+    --min-spread 3 \
+    --max-position-pct 5 \
+    --max-exposure-pct 20 \
+    --daily-loss-cap 5 \
+    --circuit-breaker 5 \
+    --scan-interval 10 \
+    --log-level INFO \
+    --live
+
+# Graceful shutdown — allow 30s for open orders to settle
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+
+# Restart policy:
+#   on-failure    — restart on crash/error (not on clean exit or SIGTERM)
+#   Delay         — 10s between restart attempts (don't spin-loop)
+#   MaxAttempts   — give up after 5 consecutive crashes in 10 minutes
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Logging — stdout/stderr both go to journal AND the log file via tee
+StandardOutput=append:/opt/polymarket/logs/bot.log
+StandardError=append:/opt/polymarket/logs/bot.log
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/polymarket/logs /opt/polymarket
+ProtectHome=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Resource limits (VPS Pro: 6 cores, 16 GB RAM)
+# Bot is single-threaded asyncio; leave headroom for OS
+LimitNOFILE=65536
+MemoryMax=4G
+CPUQuota=400%
+
+[Install]
+WantedBy=multi-user.target
